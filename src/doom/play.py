@@ -73,14 +73,24 @@ def read_hud(state, names: list[str]) -> dict:
     return hud
 
 
+_FONTS: dict[int, ImageFont.ImageFont] = {}
+
+
 def load_font(size: int):
+    cached = _FONTS.get(size)
+    if cached is not None:
+        return cached
     for path in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
     ):
         if Path(path).is_file():
-            return ImageFont.truetype(path, size=size)
-    return ImageFont.load_default()
+            font = ImageFont.truetype(path, size=size)
+            break
+    else:
+        font = ImageFont.load_default()
+    _FONTS[size] = font
+    return font
 
 
 class Recorder:
@@ -147,7 +157,7 @@ def composite(game_rgb: np.ndarray, spec: dict, episode: int, hud: dict, decisio
     y = top + game.height
     draw.rectangle((0, y, width, y + status_h), fill=(16, 42, 64))
     status = f"Episode {episode}    Kills {hud.get('kills', 0)}    Health {hud.get('health', 0)}"
-    if "ammo" in hud:
+    if spec["press_field"] == "attack" and "ammo" in hud:
         status += f"    Ammo {hud['ammo']}"
     draw.text((16, y + 5), status, fill=(232, 238, 244), font=body_font)
     y += status_h
@@ -233,7 +243,12 @@ def play_episode(game, scenario: str, buttons, engine, args, episode: int, recor
             decision = scripted_action(scenario, decisions)
             elapsed = (time.perf_counter() - started) * 1000
         else:
-            request = build_request(scenario, str(frame_path), hud if args.hud_state else None)
+            visible_hud = None
+            if args.hud_state:
+                visible_hud = {"health": hud.get("health", 0), "kills": hud.get("kills", 0)}
+                if scenario == "defend":
+                    visible_hud["ammo"] = hud.get("ammo", 0)
+            request = build_request(scenario, str(frame_path), visible_hud)
             result = engine.predict(request)
             decision = parse_answers(result["answers"], spec["press_field"])
             elapsed = float(result.get("timing", {}).get("inference_ms", (time.perf_counter() - started) * 1000))
