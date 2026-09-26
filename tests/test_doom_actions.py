@@ -4,6 +4,12 @@ import unittest
 
 from src.doom.schema import action_vector, build_request, parse_answers
 
+try:
+    from src.doom.present import FRAME_KEY, FrameStore, Overlay
+except ImportError:  # system interpreters used for the schema tests may lack Pillow
+    FrameStore = Overlay = None
+    FRAME_KEY = ""
+
 
 DEFEND = ("TURN_LEFT", "TURN_RIGHT", "ATTACK")
 HEALTH = ("TURN_LEFT", "TURN_RIGHT", "MOVE_FORWARD")
@@ -41,6 +47,38 @@ class ActionVectorTest(unittest.TestCase):
         self.assertEqual(parsed["turn"], "right")
         self.assertFalse(parsed["pressed"])
         self.assertAlmostEqual(parsed["press_confidence"], 0.66)
+
+
+@unittest.skipUnless(FrameStore is not None, "Pillow is required")
+class FramePathTest(unittest.TestCase):
+    def test_opener_serves_memory_and_survives_close(self):
+        class Module:
+            def open(self, path, *args, **kwargs):
+                raise AssertionError(f"real opener called for {path}")
+
+        module = Module()
+        store = FrameStore(module)
+        rgb = __import__("numpy").zeros((4, 6, 3), dtype="uint8")
+        rgb[0, 0] = (9, 8, 7)
+        self.assertEqual(store.bind(rgb), FRAME_KEY)
+        opened = module.open(FRAME_KEY)
+        self.assertEqual(opened.getpixel((0, 0)), (9, 8, 7))
+        opened.close()
+        self.assertEqual(module.open(FRAME_KEY).getpixel((0, 0)), (9, 8, 7))
+        with self.assertRaises(AssertionError):
+            module.open("/other.png")
+
+    def test_overlay_stamp_shape(self):
+        import numpy as np
+        from PIL import ImageFont
+
+        spec = {"title": "Defend the line", "subtitle": "Hold.", "press_field": "attack"}
+        decision = {"turn": "stay", "press_label": "yes", "turn_confidence": 0.8, "press_confidence": 0.6}
+        overlay = Overlay(spec, 1, decision, "note", 8, 4, lambda _size: ImageFont.load_default())
+        frame = np.zeros((4, 8, 3), dtype=np.uint8)
+        stamped = overlay.stamp(frame, {"kills": 1, "health": 90, "ammo": 10})
+        self.assertEqual(stamped.shape, (4 + 56 + 28 + 70 + 22, 8, 3))
+        self.assertEqual(overlay.stamp(frame, {"kills": 2, "health": 80, "ammo": 9}).shape, stamped.shape)
 
 
 if __name__ == "__main__":

@@ -29,8 +29,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import ImageFont
 
+from src.doom.present import FrameStore, Overlay
 from src.doom.schema import SCENARIOS, action_vector, build_request, button_name, parse_answers
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,13 +46,17 @@ def load_engine(checkpoint: Path, device: str, dtype: str, attn: str):
         )
     spec = importlib.util.spec_from_file_location("intern_decision_checkpoint", module_path)
     module = importlib.util.module_from_spec(spec)
+    # Python 3.14 dataclasses look the class up in sys.modules during decoration.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.DecisionEngine(
+    engine = module.DecisionEngine(
         checkpoint=str(checkpoint),
         device=device,
         dtype=dtype,
         attn_implementation=attn,
     )
+    engine.frames = FrameStore(module.Image)
+    return engine
 
 
 def screen_hwc(buffer) -> np.ndarray:
@@ -142,41 +147,6 @@ class Recorder:
             raise RuntimeError(f"ffmpeg exited {code} while writing {self.path}")
 
 
-def composite(game_rgb: np.ndarray, spec: dict, episode: int, hud: dict, decision: dict | None, note: str) -> np.ndarray:
-    game = Image.fromarray(game_rgb, mode="RGB")
-    width = game.width
-    top, status_h, decision_h, footer_h = 56, 28, 70, 22
-    canvas = Image.new("RGB", (width, top + game.height + status_h + decision_h + footer_h), (10, 16, 28))
-    draw = ImageDraw.Draw(canvas)
-    title_font = load_font(22)
-    body_font = load_font(16)
-    small_font = load_font(14)
-    draw.text((16, 8), spec["title"], fill=(244, 246, 250), font=title_font)
-    draw.text((16, 34), spec["subtitle"], fill=(186, 196, 210), font=small_font)
-    canvas.paste(game, (0, top))
-    y = top + game.height
-    draw.rectangle((0, y, width, y + status_h), fill=(16, 42, 64))
-    status = f"Episode {episode}    Kills {hud.get('kills', 0)}    Health {hud.get('health', 0)}"
-    if spec["press_field"] == "attack" and "ammo" in hud:
-        status += f"    Ammo {hud['ammo']}"
-    draw.text((16, y + 5), status, fill=(232, 238, 244), font=body_font)
-    y += status_h
-    if decision is None:
-        turn_text, press_text = "TURN: …", f"{spec['press_field'].upper()}: …"
-        turn_conf = press_conf = ""
-    else:
-        turn_text = f"TURN: {decision['turn'].upper()}"
-        press_text = f"{spec['press_field'].upper()}: {decision['press_label'].upper()}"
-        turn_conf = f"Model confidence {decision['turn_confidence'] * 100:.0f}%"
-        press_conf = f"Model confidence {decision['press_confidence'] * 100:.0f}%"
-    draw.text((16, y + 8), turn_text, fill=(64, 220, 196), font=title_font)
-    draw.text((width // 2, y + 8), press_text, fill=(64, 220, 196), font=title_font)
-    draw.text((16, y + 40), turn_conf, fill=(210, 220, 230), font=small_font)
-    draw.text((width // 2, y + 40), press_conf, fill=(210, 220, 230), font=small_font)
-    draw.text((16, canvas.height - 18), note, fill=(150, 162, 176), font=small_font)
-    return np.asarray(canvas)
-
-
 def open_game(config_path: Path, visible: bool, sound: bool, seed: int | None):
     import vizdoom as vzd
 
@@ -216,9 +186,6 @@ def scripted_action(scenario: str, step: int) -> dict:
 
 def play_episode(game, scenario: str, buttons, engine, args, episode: int, recorder, trace) -> dict:
     spec = SCENARIOS[scenario]
-    frame_dir = Path(args.output) / "frames"
-    frame_dir.mkdir(parents=True, exist_ok=True)
-    frame_path = frame_dir / f"{scenario}.png"
     note = "Scripted buttons | game-time playback" if engine is None else (
         "Image-driven Intern-Decision | game-time playback; inference pauses omitted"
     )
@@ -237,7 +204,6 @@ def play_episode(game, scenario: str, buttons, engine, args, episode: int, recor
             break
         hud = read_hud(state, variable_names)
         screen = screen_hwc(state.screen_buffer)
-        Image.fromarray(screen, mode="RGB").save(frame_path)
         started = time.perf_counter()
         if engine is None:
             decision = scripted_action(scenario, decisions)
@@ -248,7 +214,7 @@ def play_episode(game, scenario: str, buttons, engine, args, episode: int, recor
                 visible_hud = {"health": hud.get("health", 0), "kills": hud.get("kills", 0)}
                 if scenario == "defend":
                     visible_hud["ammo"] = hud.get("ammo", 0)
-            request = build_request(scenario, str(frame_path), visible_hud)
+            request = build_request(scenario, engine.frames.bind(screen), visible_hud)
             result = engine.predict(request)
             decision = parse_answers(result["answers"], spec["press_field"])
             elapsed = float(result.get("timing", {}).get("inference_ms", (time.perf_counter() - started) * 1000))
@@ -274,14 +240,18 @@ def play_episode(game, scenario: str, buttons, engine, args, episode: int, recor
             f"  hp={hud.get('health', '?'):>3}  kills={hud.get('kills', '?'):>3}  {elapsed:7.0f} ms",
             flush=True,
         )
+        overlay = None
         for _ in range(args.frame_skip):
             if game.is_episode_finished():
                 break
             total_reward += float(game.make_action(vector, 1))
             held = game.get_state()
-            if recorder is not None and held is not None and held.screen_buffer is not None:
-                held_hud = read_hud(held, variable_names)
-                recorder.write(composite(screen_hwc(held.screen_buffer), spec, episode, held_hud, decision, note))
+            if recorder is None or held is None or held.screen_buffer is None:
+                continue
+            held_screen = screen_hwc(held.screen_buffer)
+            if overlay is None:
+                overlay = Overlay(spec, episode, decision, note, held_screen.shape[1], held_screen.shape[0], load_font)
+            recorder.write(overlay.stamp(held_screen, read_hud(held, variable_names)))
         record["reward_so_far"] = total_reward
         trace.write(json.dumps(record) + "\n")
         trace.flush()
@@ -326,16 +296,27 @@ def run(args):
         try:
             with trace_path.open("w", encoding="utf-8") as trace:
                 summary = play_episode(game, scenario, buttons, engine, args, 1, recorder, trace)
-            summaries.append(summary)
+        except Exception as exc:
+            if exc.__class__.__name__ != "ViZDoomUnexpectedExitException":
+                raise
+            summary = {
+                "scenario": scenario,
+                "episode": 1,
+                "error": "ViZDoom exited before the episode ended. The window may have been closed.",
+                "trace": str(trace_path),
+            }
+            print(f"{scenario} interrupted: {summary['error']}", flush=True)
         finally:
             if recorder is not None:
                 recorder.close()
             game.close()
-        print(
-            f"{scenario} done: decisions={summary['decisions']} reward={summary['reward']:.1f} "
-            f"mean_inference_ms={summary['mean_inference_ms']}",
-            flush=True,
-        )
+        summaries.append(summary)
+        if "decisions" in summary:
+            print(
+                f"{scenario} done: decisions={summary['decisions']} reward={summary['reward']:.1f} "
+                f"mean_inference_ms={summary['mean_inference_ms']}",
+                flush=True,
+            )
     summary_path = args.output / "summary.json"
     summary_path.write_text(json.dumps(summaries, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {summary_path}", flush=True)
